@@ -19,8 +19,8 @@ typedef struct _UNICODE_STRING {
 #include "chatbot_secrets.h"
 
 #pragma comment(lib, "Ws2_32.lib")
-#pragma comment (lib, "secur32.lib")
-#pragma comment (lib, "shlwapi.lib")
+#pragma comment(lib, "secur32.lib")
+#pragma comment(lib, "shlwapi.lib")
 
 // payload + extra over head for header/mac/padding (probably an overestimate)
 #define TLS_MAX_PACKET_SIZE (16384 + 512)
@@ -96,8 +96,8 @@ static int tls_connect(struct TLSSocket *s, const char *hostname, const char *po
     SCH_CREDENTIALS creds = {
         .dwVersion = SCH_CREDENTIALS_VERSION,
         .dwFlags = SCH_USE_STRONG_CRYPTO          // use only strong crypto alogorithms
-                     | SCH_CRED_AUTO_CRED_VALIDATION  // automatically validate server certificate
-                     | SCH_CRED_NO_DEFAULT_CREDS     // no client certificate authentication
+                    | SCH_CRED_AUTO_CRED_VALIDATION  // automatically validate server certificate
+                    | SCH_CRED_NO_DEFAULT_CREDS     // no client certificate authentication
     };
 
     if (AcquireCredentialsHandleA(NULL, UNISP_NAME_A, SECPKG_CRED_OUTBOUND, NULL, (void*)&creds, NULL, NULL, &s->handle, NULL) != SEC_E_OK) {
@@ -124,8 +124,8 @@ static int tls_connect(struct TLSSocket *s, const char *hostname, const char *po
 
         SecBufferDesc indesc = { SECBUFFER_VERSION, ARRAYSIZE(inbuffers), inbuffers };
         SecBufferDesc outdesc = { SECBUFFER_VERSION, ARRAYSIZE(outbuffers), outbuffers };
-        DWORD flags = ISC_REQ_USE_SUPPLIED_CREDS | ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_CONFIDENTIALITY | ISC_REQ_REPLAY_DETECT | ISC_REQ_SEQUENCE_DETECT | ISC_REQ_STREAM;
 
+        DWORD flags = ISC_REQ_USE_SUPPLIED_CREDS | ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_CONFIDENTIALITY | ISC_REQ_REPLAY_DETECT | ISC_REQ_SEQUENCE_DETECT | ISC_REQ_STREAM;
         SECURITY_STATUS sec = InitializeSecurityContextA(
             &s->handle,
             context,
@@ -232,47 +232,6 @@ static int tls_connect(struct TLSSocket *s, const char *hostname, const char *po
     }
 
     return 0;
-#if 0
-    // We have a valid connection
-    const char http_request_oauth_token[] = "POST " REQUEST_OAUTH2_TOKEN " HTTP/1.1\n" "Host: " TWITCH_HOSTNAME "\n" "Accept: application/json\n" "Accept-Encoding: \n" "Accept-Language: en-?US, en; q=0.5\n" "Content-Type: application/x-www-form-urlencoded\n\n";
-
-#define BUFLEN 2048
-    char recvbuf[BUFLEN];
-    int recvbuflen = BUFLEN; 
-
-    // Send request
-    if ((ws_result = send(s->sock, http_request_oauth_token, (int) sizeof http_request_oauth_token, 0)) == SOCKET_ERROR) {
-        printf("send failed: %d\n", WSAGetLastError());
-        closesocket(s->sock);
-        WSACleanup();
-        return 1;
-    }
-
-    printf("Bytes sent: %ld\n", ws_result);
-
-    // shutdown the connection for sending since no more data will be sent
-    // the client can still use the ConnectSocket for receiving data
-    ws_result = shutdown(s->sock, SD_SEND);
-    if (ws_result == SOCKET_ERROR) {
-        printf("shutdown failed: %d\n", WSAGetLastError());
-        closesocket(s->sock);
-        WSACleanup();
-        return 1;
-    }
-
-    // Receive data until the server closes the connection
-    do {
-        ws_result = recv(s->sock, recvbuf, recvbuflen, 0);
-        if (ws_result > 0)
-            printf("Bytes received: %d\n", ws_result);
-        else if (ws_result == 0)
-            printf("Connection closed\n");
-        else
-            printf("recv failed: %d\n", WSAGetLastError());
-    } while (ws_result > 0);
-
-    printf("Recv: %s\n", recvbuf);
-#endif
 }
 
 static int tls_disconnect(struct TLSSocket* s)
@@ -321,15 +280,13 @@ int main(int argc, char *argv[]) {
     const char *hostname = "id.twitch.tv";
     const char *path = "/oauth2/token" "?client_id=" CLIENT_ID "&client_secret=" CLIENT_SECRET "&grant_type=client_credentials"; 
     struct TLSSocket s;
-    if (tls_connect(&s, "id.twitch.tv", "443") != 0) {
+    if (tls_connect(&s, hostname, "443") != 0) {
         printf("Error connecting to %s\n", hostname);
         return -1;
     }
-
     printf("Connected!\n");
 
-
-    printf("Disconnected!\n");
     tls_disconnect(&s);
+    printf("Disconnected!\n");
     return 0;
 }
