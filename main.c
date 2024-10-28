@@ -14,13 +14,17 @@ typedef struct _UNICODE_STRING {
 #include <schannel.h>
 #include <shlwapi.h>
 
-#include <stdio.h>
-
-#include "chatbot_secrets.h"
-
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "secur32.lib")
 #pragma comment(lib, "shlwapi.lib")
+
+#include <stdio.h>
+#include <assert.h>
+
+#include "chatbot_secrets.h"
+
+#define JSMN_STATIC
+#include "jsmn.h"
 
 // payload + extra over head for header/mac/padding (probably an overestimate)
 #define TLS_MAX_PACKET_SIZE (16384 + 512)
@@ -234,6 +238,144 @@ static int tls_connect(struct TLSSocket *s, const char *hostname, const char *po
     return 0;
 }
 
+
+static int tls_write(struct TLSSocket *s, const void *buffer, int size)
+{
+    while (size != 0) {
+        int use = min(size, s->sizes.cbMaximumMessage);
+        char wbuffer[TLS_MAX_PACKET_SIZE];
+        assert(s->sizes.cbHeader + s->sizes.cbMaximumMessage + s->sizes.cbTrailer <= sizeof(wbuffer));
+
+        SecBuffer buffers[3];
+        buffers[0].BufferType = SECBUFFER_STREAM_HEADER;
+        buffers[0].pvBuffer = wbuffer;
+        buffers[0].cbBuffer = s->sizes.cbHeader;
+        buffers[1].BufferType = SECBUFFER_DATA;
+        buffers[1].pvBuffer = wbuffer + s->sizes.cbHeader;
+        buffers[1].cbBuffer = use;
+        buffers[2].BufferType = SECBUFFER_STREAM_TRAILER;
+        buffers[2].pvBuffer = wbuffer + s->sizes.cbHeader + use;
+        buffers[2].cbBuffer = s->sizes.cbTrailer;
+
+        CopyMemory(buffers[1].pvBuffer, buffer, use);
+
+        SecBufferDesc desc = { SECBUFFER_VERSION, ARRAYSIZE(buffers), buffers };
+        SECURITY_STATUS sec = EncryptMessage(&s->context, 0, &desc, 0);
+        if (sec != SEC_E_OK) {
+            // this should not happen, but just in case check it
+            return -1;
+        }
+
+        int total = buffers[0].cbBuffer + buffers[1].cbBuffer + buffers[2].cbBuffer,
+            sent = 0;
+
+        while (sent != total) {
+            int d = send(s->sock, wbuffer + sent, total - sent, 0);
+            if (d <= 0)
+                return -1; // error sending data through socket, or server disconnected
+            
+            sent += d;
+        }
+
+        buffer = (char*)buffer + use;
+        size -= use;
+    }
+
+    return 0;
+}
+
+// blocking read, waits & reads up to size bytes, returns amount of bytes received on success (<= size)
+// returns 0 on disconnect or negative value on error
+static int tls_read(struct TLSSocket *s, void *buffer, int size)
+{
+    int result = 0;
+
+    while (size != 0) {
+        if (s->decrypted) {
+            // if there is decrypted data available, then use it as much as possible
+            int use = min(size, s->available);
+            CopyMemory(buffer, s->decrypted, use);
+            buffer = (char*)buffer + use; // advance buffer ptr
+            size -= use;
+            result += use;
+
+            if (use == s->available) {
+                // all decrypted data is used, remove ciphertext from incoming buffer so next time it starts from beginning
+                MoveMemory(s->incoming, s->incoming + s->used, s->received - s->used);
+                s->received -= s->used;
+                s->used = 0;
+                s->available = 0;
+                s->decrypted = NULL;
+            } else {
+                s->available -= use;
+                s->decrypted += use;
+            }
+        } else {
+            // if any ciphertext data avilable then try to decrypt it
+            if (s->received != 0) {
+                SecBuffer buffers[4];
+                assert(s->sizes.cBuffers == ARRAYSIZE(buffers));
+
+                // this is the raw encrypted input buffer
+                buffers[0].BufferType = SECBUFFER_DATA;
+                buffers[0].pvBuffer = s->incoming;
+                buffers[0].cbBuffer = s->received;
+
+                buffers[1].BufferType = buffers[2].BufferType = buffers[3].BufferType = SECBUFFER_EMPTY;
+
+                SecBufferDesc desc = { SECBUFFER_VERSION, ARRAYSIZE(buffers), buffers };
+                SECURITY_STATUS sec = DecryptMessage(&s->context, &desc, 0, NULL);\
+                if (sec == SEC_E_OK) {
+                    assert(buffers[0].BufferType == SECBUFFER_STREAM_HEADER);
+                    assert(buffers[1].BufferType == SECBUFFER_DATA);
+                    assert(buffers[2].BufferType == SECBUFFER_STREAM_TRAILER);
+
+                    s->decrypted = buffers[1].pvBuffer;
+                    s->available = buffers[1].cbBuffer;
+                    s->used = s->received - (buffers[3].BufferType == SECBUFFER_EXTRA ? buffers[3].cbBuffer : 0);
+
+                    // data is now decrypted, go back to beginning of loop to copy memory to output buffer
+                    continue;
+                } else if (sec == SEC_I_CONTEXT_EXPIRED) {
+                    // server closed TLS connection (but socket is still open)
+                    s->received = 0;
+                    return result;
+                } else if (sec == SEC_I_RENEGOTIATE) {
+                    // server wants to renegotiate TLS connection, not implemented here
+                    return -1;
+                } else if (sec != SEC_E_INCOMPLETE_MESSAGE) {
+                    // some other schannel or TLS protocol error
+                    return -1;
+                }
+                // otherwise sec == SEC_E_INCOMPLETE_MESSAGE which means need to read more data
+            }
+
+            // otherwise not enough data received to decrypt
+            if (result != 0) {
+                break;
+            }
+
+            if (s->received == sizeof(s->incoming)) {
+                // server is sending too much garbage data instead of proper TLS packet
+                return -1;
+            }
+
+            // wait for more ciphertext data from server
+            int r = recv(s->sock, s->incoming + s->received, sizeof(s->incoming) - s->received, 0);
+            if (r <= 0) {
+                // server disconnected socket
+                return 0;
+            } else if (r < 0) {
+                return -1; // error receiving data from socket
+            }
+
+            s->received += r;
+        }
+    }
+
+    return result;
+}
+
 static int tls_disconnect(struct TLSSocket* s)
 {
     DWORD type = SCHANNEL_SHUTDOWN;
@@ -276,17 +418,120 @@ static int tls_disconnect(struct TLSSocket* s)
     return 0;
 }
 
-int main(int argc, char *argv[]) {
-    const char *hostname = "id.twitch.tv";
-    const char *path = "/oauth2/token" "?client_id=" CLIENT_ID "&client_secret=" CLIENT_SECRET "&grant_type=client_credentials"; 
-    struct TLSSocket s;
-    if (tls_connect(&s, hostname, "443") != 0) {
-        printf("Error connecting to %s\n", hostname);
+#define TWITCH_ID_HOSTNAME "id.twitch.tv"
+#define TWITCH_API_HOSTNAME "api.twitch.tv" 
+#define OAUTH2_TOKEN_PATH "/oauth2/token" "?client_id=" CLIENT_ID "&client_secret=" CLIENT_SECRET "&grant_type=client_credentials" 
+#define CRLF "\x0D\x0A"
+#define CHAT_CHANNEL_USER_ID "saidwho13"
+#define CHATBOT_USER_ID "saidwho13"
+
+
+int make_https_request(struct TLSSocket* s, const char *req, int req_len, char *res, int max_resp_len) {
+    int err;
+    if (err = tls_write(s, req, req_len), err != 0) {
+        printf("tls_write failed\n");
         return -1;
     }
-    printf("Connected!\n");
 
-    tls_disconnect(&s);
+    int res_len;
+    if (res_len = tls_read(s, res, max_resp_len), res_len <= 0) {
+        printf("tls_read failed\n");
+        return -1;
+    }
+
+    return res_len;
+}
+
+int send_chat_message(struct TLSSocket* s, const char *oauth_token, const char* msg)
+{
+    char req[1024], res[1024];
+    int req_len, res_len;
+    req_len = snprintf(req, sizeof(req), "POST /helix/chat/messages HTTP/1.1" CRLF "Authorization: Bearer %s" CRLF "Client-Id: " CLIENT_ID CRLF "Content-Type: application/json" CRLF CRLF "{broadcaster_id: \"" CHAT_CHANNEL_USER_ID "\", sender_id: \"" CHATBOT_USER_ID "\", message: \"%s\"}" CRLF CRLF,
+        oauth_token, msg);
+
+    if (res_len = make_https_request(s, req, req_len, res, sizeof(res)), res_len <= 0) {
+        printf("Failed to make HTTP request to server\n");
+        return -1;
+    }
+
+    printf("HTTP REQUEST:\n%.*s\n", req_len, req);
+    printf("HTTP RESPONSE:\n%.*s\n", res_len, res);
+
+    return res_len;
+}
+
+int main(void) {
+    struct TLSSocket twitch_id_socket, twitch_api_socket;
+    if (tls_connect(&twitch_id_socket, TWITCH_ID_HOSTNAME, "443") != 0) {
+        printf("Error connecting to %s\n", TWITCH_ID_HOSTNAME);
+        return -1;
+    }
+    printf("Connected to %s\n", TWITCH_ID_HOSTNAME);
+
+    if (tls_connect(&twitch_api_socket, TWITCH_API_HOSTNAME, "443") != 0) {
+        printf("Error connecting to %s\n", TWITCH_API_HOSTNAME);
+        return -1;
+    }
+
+    printf("Connected to %s\n", TWITCH_API_HOSTNAME);
+
+    char req[1024], res[1024];
+    int req_len, res_len;
+    
+    // Request oauth2 token from twitch
+    req_len = snprintf(req, sizeof(req), "POST " "/oauth2/token" "?client_id=" CLIENT_ID "&client_secret=" CLIENT_SECRET "&grant_type=client_credentials" " HTTP/1.1" CRLF "Host: " TWITCH_ID_HOSTNAME CRLF "Content-Type: application/x-www-form-urlencoded" CRLF CRLF);
+    if (res_len = make_https_request(&twitch_id_socket, req, req_len, res, sizeof(res)), res_len <= 0) {
+        printf("Error getting Oauth2 token\n");
+        return -1;
+    }
+
+    int times = 2;
+    int i = 0, data_start, data_end;
+    while (i <= res_len - 4 && times) {
+        if (!memcmp(&res[i], CRLF CRLF, 4)) {
+            if (times == 2) {
+                data_start = i + 4;
+            } else if (times == 1) {
+                data_end = i;
+            }
+
+            --times;
+        }
+
+        ++i;
+    }
+
+    printf("data: %.*s\n", data_end - data_start, &res[data_start]);
+    char oauth_token[32];
+    ZeroMemory(oauth_token, sizeof(oauth_token));
+
+    {
+        jsmn_parser p;
+        jsmntok_t t[128];
+        jsmn_init(&p);
+        int r = jsmn_parse(&p, &res[data_start], data_end - data_start, t, sizeof(t));
+        CopyMemory(oauth_token, &res[data_start + t[2].start], t[2].end - t[2].start);
+        // while (--r) {
+        //     printf("Token: %.*s\n", t[r].end - t[r].start, &res[data_start + t[r].start]);
+        // }
+    }
+    printf("OAuth2 Token: %s\n", oauth_token);
+
+    // Validate OAuth2 token
+    req_len = snprintf(req, sizeof(req), "GET /oauth2/validate HTTP/1.1" CRLF "Authorization: Bearer %s" CRLF CRLF, oauth_token);
+    if (res_len = make_https_request(&twitch_id_socket, req, req_len, res, sizeof(res)), res_len <= 0) {
+        printf("Error validating Oauth2 token\n");
+        return -1;
+    }
+
+    printf("HTTP RESPONSE:\n%.*s\n", res_len, res);
+
+    printf("Validated OAuth2 token\n");
+
+    send_chat_message(&twitch_api_socket, oauth_token, "Hello, Chat!");
+
+    tls_disconnect(&twitch_id_socket);
+    tls_disconnect(&twitch_api_socket);
     printf("Disconnected!\n");
     return 0;
 }
