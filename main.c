@@ -488,7 +488,7 @@ int main(void) {
     int times = 2;
     int i = 0, data_start, data_end;
     while (i <= res_len - 4 && times) {
-        if (!memcmp(&res[i], CRLF CRLF, 4)) {
+        if (RtlCompareMemory(&res[i], CRLF CRLF, 4) == 4) {
             if (times == 2) {
                 data_start = i + 4;
             } else if (times == 1) {
@@ -504,16 +504,12 @@ int main(void) {
     printf("data: %.*s\n", data_end - data_start, &res[data_start]);
     char oauth_token[32];
     ZeroMemory(oauth_token, sizeof(oauth_token));
-
     {
         jsmn_parser p;
         jsmntok_t t[128];
         jsmn_init(&p);
         int r = jsmn_parse(&p, &res[data_start], data_end - data_start, t, sizeof(t));
         CopyMemory(oauth_token, &res[data_start + t[2].start], t[2].end - t[2].start);
-        // while (--r) {
-        //     printf("Token: %.*s\n", t[r].end - t[r].start, &res[data_start + t[r].start]);
-        // }
     }
     printf("OAuth2 Token: %s\n", oauth_token);
 
@@ -524,6 +520,7 @@ int main(void) {
         return -1;
     }
 
+    printf("HTTP REQUEST:\n%.*s\n", req_len, req);
     printf("HTTP RESPONSE:\n%.*s\n", res_len, res);
 
     printf("Validated OAuth2 token\n");
